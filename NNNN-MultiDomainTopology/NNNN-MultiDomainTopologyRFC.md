@@ -91,9 +91,12 @@ storage has one linear physical base.
 Existing components provide useful primitives but not the complete semantic
 model:
 
-- torch-spyre represents Spyre as one PrivateUse1 device and has an experimental
-  byte-interleaved placement path, but that path does not represent semantic
-  tensor shards;
+- torch-spyre represents Spyre as one PrivateUse1 device and now has a landed
+  semantic sharding slice (`distribute_tensor`/`full_tensor`, a
+  torch-spyre-owned shard table, segment-emulated receipts, and same-placement
+  pointwise `add`), but that slice
+  allocates through the single-domain segment-emulated path and does not yet
+  place shards in explicit logical HBM groups;
 - Flex can represent multiple chunks in a `CompositeAddress`, but the production
   path does not yet provide the explicit eight-group allocation and immutable
   semantic receipt required here;
@@ -187,13 +190,114 @@ Phase 1 uses stock public PyTorch APIs and requires no modified PyTorch build,
 c10d initialization, or distributed runtime. Public TP placement values are
 inputs to torch-spyre planning, not a dependency on distributed execution.
 
-Rollout begins with the proposed explicit blocking API
-`torch.spyre.to_sharded()`, accepting a concrete public
-`torch.distributed.tensor.Shard(dim)` placement:
+Rollout begins with the explicit blocking API
+`torch.spyre.distribute_tensor()`:
 
 ```python
-x = torch.spyre.to_sharded(x_cpu, placement=Shard(0))
+from torch.distributed.tensor import Shard
+
+x = torch.spyre.distribute_tensor(x_cpu, Shard(0))
+z = torch.add(x, x)                     # compiled sharded pointwise
+x_cpu = torch.spyre.full_tensor(x)      # gather; .to("cpu")/.cpu() equivalent
+
+torch.spyre.is_sharded(x)               # True
+info = torch.spyre.sharding_info(x)     # placement, num_shards, receipt
 ```
+
+The full signature is:
+
+```python
+torch.spyre.distribute_tensor(
+    tensor,                             # CPU source tensor
+    placement,                          # Shard(dim) or [Shard(dim)]
+    *,
+    num_shards: int | None = None,      # default: active core count
+) -> torch.Tensor                       # global-shape tensor on spyre:0
+
+torch.spyre.full_tensor(tensor) -> torch.Tensor
+torch.spyre.is_sharded(tensor) -> bool
+torch.spyre.sharding_info(tensor) -> ShardedTensorInfo
+```
+
+#### API rationale
+
+The API is designed so a PyTorch Tensor Parallel user recognizes every token
+of the calling pattern, while nothing is promised that intra-device sharding
+cannot deliver. The decisions, and why:
+
+- **The name is `distribute_tensor`, the exact TP entry-point name.** A TP
+  user porting `distribute_tensor(x, mesh, [Shard(0)])` finds the spyre
+  equivalent by name, and the argument order `(tensor, placement)` mirrors
+  TP's `(input, mesh, placements)` with the mesh slot removed. The name is
+  also placement-union-neutral: it stays correct when `Replicate`-style
+  placements are admitted later, which a name like `to_sharded` would not —
+  one cannot "shard" a tensor into replicas. `to_sharded` was rejected on
+  exactly this ground.
+- **No mesh is exposed.** In TP, `DeviceMesh` names a set of communicating
+  ranks that collectives route over and that the user owns. This target has
+  one process, no ranks, and no collectives; the shard count is a hardware
+  fact and the topology is owned by a validated runtime snapshot (here, the
+  `MultiDomainTopology` profile). The device *is* the mesh. A user-facing
+  mesh type would promise `redistribute()`, DTensor interop, and autograd
+  through distribution — none of which exist — and would create a second
+  source of truth that can contradict the qualified topology. This RFC's
+  Summary already rules out a distributed `DeviceMesh`; the API follows.
+- **`num_shards` defaults to the active core count.** TP users never state
+  the shard count; the mesh owns it. The intra-device equivalent resolves
+  the count from the device at call time. An explicit value remains
+  admitted and cross-checked against the topology (fail-closed), and the
+  parameter is kept because a future stack-balanced four-shard placement
+  will need it. A fixed default such as `8` was rejected: it looks like a
+  free parameter and is silently wrong whenever the active core count
+  differs.
+- **`placement` accepts `Shard(dim)` or `[Shard(dim)]`.** TP users type the
+  list form by muscle memory, so it is accepted and normalized; exactly one
+  placement is admitted because there is no multi-dimensional mesh. The
+  parameter name stays singular — a plural `placements` would promise
+  one-per-mesh-dim semantics the device cannot honor.
+- **`full_tensor` mirrors `DTensor.full_tensor()`** for the gather, so the
+  TP vocabulary round-trips end to end; `.to("cpu")` and `.cpu()` remain
+  equivalent spellings.
+- **`is_sharded(tensor)` follows PyTorch's own predicate pattern.** TP users
+  check `isinstance(x, DTensor)`, which works there because DTensor is a
+  subclass; this API deliberately returns a plain `torch.Tensor`, so
+  `isinstance` cannot work and a predicate function is the honest
+  substitute. The name follows `torch.is_sparse` — sharding is morally a
+  property of the tensor's storage layout, and every PyTorch user
+  recognizes the `is_sparse`/`is_contiguous` shape even though it is not TP
+  vocabulary.
+- **`sharding_info(tensor)` follows the record-returning inspection
+  pattern** of `torch.cuda.get_device_properties`, because attributes
+  cannot be attached to a plain `torch.Tensor` per device. Its fields are
+  what a TP user would look for: `info.placement` holds the same public
+  `Shard` object as `dt.placements[0]` in TP, and `info.num_shards` is the
+  intra-device spelling of `dt.device_mesh.size()`. `shard_device_bytes`
+  and the validated placement `receipt` have no TP analog; they are
+  hardware inspection and this RFC's novel contract respectively, and are
+  documented as such. The field is named `placement` (singular) for the
+  same reason the constructor argument is: a plural `placements` sequence
+  in TP holds one placement per mesh dimension, which no mesh means we
+  cannot honor.
+- **There is no `to_local()`.** A TP user's third reflex is to ask for the
+  shard that lives on the local rank. It is deliberately absent: a
+  shard-local view of the composite storage would be exactly the kind of
+  view that compiled kernels must reject (a consumer would address one
+  chunk through a single base), so exposing one would undercut the
+  fail-closed rule. Shard-local data is reachable only through the explicit
+  gather (`full_tensor`), never as an addressable view.
+- **The divergence is documented at the point of use.** The docstring
+  states plainly that the result is a plain `torch.Tensor` — no DTensor, no
+  mesh, no collectives, no autograd, equal shards only. The fail-closed
+  design (every unsupported operation raises before partial work) makes
+  each wrong TP expectation fail loudly rather than silently, which is what
+  makes reusing the TP name safe: the cost of a mistaken assumption is one
+  named error, never a wrong result.
+
+The torch-spyre side of this API (validation, equal-shard planning, the
+torch-spyre-owned shard table, segment-emulated receipts, and
+same-placement pointwise `add` with launch-time shard-address resolution)
+is implemented today; the native multi-domain allocation, topology, and
+DeepTools contract below remain proposed.
 
 After native allocation, migration, error handling, and pointwise execution are
 qualified, an opt-in policy may route eligible `.to("spyre")` calls through the
@@ -310,9 +414,12 @@ qualification; it is not arbitrary user tuning. It includes a target identity
 and fingerprint used for compiler and launch validation.
 
 The implementation must not calculate endpoint IDs from an HBM-group or shard
-number. An unknown target, malformed profile, unavailable endpoint, or uncovered
-sparing state fails closed. Dynamic topology and cost-based endpoint selection
-are follow-on capabilities.
+number, and it must not derive an HBM-group assignment from shard-number
+arithmetic: the mapping from shard (or mesh coordinate) to logical HBM group
+comes from the qualified `MultiDomainTopology` snapshot, because core sparing
+changes which cores and HMIs serve which group. An unknown target, malformed
+profile, unavailable endpoint, or uncovered sparing state fails closed. Dynamic
+topology and cost-based endpoint selection are follow-on capabilities.
 
 The current public Senlib DVA representation fixes `VA[39]` to zero. The initial
 path must either qualify that behavior for every requester it uses or remain
@@ -340,6 +447,12 @@ later stages:
 
 The collection of eight records is canonical. Downstream components consume it
 rather than recomputing shard ranges.
+
+This metadata travels with the tensor's storage, not in a separate registry.
+Any component that holds the tensor — a host copy, a resize, a kernel launch —
+can ask the storage whether it is sharded and read its placement, without
+calling back into Python or consulting a sidecar table. This is what lets
+every consumer reject unsupported use before touching device memory.
 
 Each shard receives an independently constructed `SpyreTensorLayout`. The
 implementation must not divide one globally encoded byte buffer into eighths
@@ -656,6 +769,13 @@ There is no silent fallback to chunk zero, one address per tensor, a fabricated
 unified base, or a different placement. A safe fallback must be an explicit
 semantic gather, operation, and redistribution.
 
+Every component that consumes placement evidence re-validates it; no component
+trusts a receipt it did not check itself. The allocator placing eight shards
+in eight groups is a claim, not proof: the requester proves the recorded
+extents are disjoint and aligned, and the launcher proves the live tensor's
+shard count and per-shard size match what the program was compiled for. Each
+boundary checks, then trusts.
+
 The existing unified allocation and execution path remains unchanged for tensors
 without semantic sharding. Existing single-domain targets remain on their
 current allocator and runtime paths. Capability guards prevent multi-domain
@@ -781,7 +901,10 @@ canonical user object.
 
 Equal byte division cannot express logical shard ranges, per-shard layouts,
 padding, or explicit output placement. Flex should realize a plan rather than
-infer PyTorch semantics.
+infer PyTorch semantics. Byte-interleaved placement may coexist for *unsharded*
+streaming tensors such as replicated weights or KV caches, where aggregate HBM
+bandwidth matters and no shard-to-locality contract exists; it is a placement
+policy for those tensors, not a sharding mechanism for sharded storage.
 
 ### Encode HBM groups in tensor strides
 
@@ -821,9 +944,16 @@ semantic concepts while keeping one-process, intra-device composite storage
 distinct from rank-local distributed storage.
 
 Existing torch-spyre experimental work on interleaved HBM placement established
-a separation between logical tensor properties and physical HBM placement. This
-proposal extends that principle from a byte-oriented, one-endpoint-per-chunk path
-to semantic shards and multiple-endpoint execution per HBM group. That work is
+a separation between logical tensor properties and physical HBM placement. The
+landed sharded-tensor slice extends that principle
+to semantic shards: `torch.spyre.distribute_tensor(x, Shard(dim))` with a
+torch-spyre-owned shard table, validated generation-neutral placement receipts,
+and one compiled pointwise op whose per-endpoint start addresses stay symbolic
+until launch — the intra-device, single-process TP model this RFC generalizes
+from eight segment-emulated chunks to eight logical HBM groups and 32
+endpoints. This proposal extends that slice with explicit multi-group
+placement, the `MultiDomainTopology` contract, and the DeepTools
+program-correction interface. That work is
 not cited as an RFC until its document is added to the RFC repository.
 
 The
@@ -903,8 +1033,9 @@ program correctly.
    compute submission?
 
 A read-only public placement-inspection API is useful for diagnostics but does
-not block the proposed `torch.spyre.to_sharded()` constructor. Its design is
-deferred until the placement and receipt contracts are stable.
+not block the `torch.spyre.distribute_tensor()` constructor (landed as
+`torch.spyre.sharding_info()`). Its design is deferred until the placement
+and receipt contracts are stable.
 
 ### Implementation validation gates
 

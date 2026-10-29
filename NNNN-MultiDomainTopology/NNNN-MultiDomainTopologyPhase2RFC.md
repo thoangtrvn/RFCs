@@ -2,9 +2,25 @@
 
 **Authors:** Tuan M. Hoang Trong, Mudhakar Srivatsa
 
-> **Status:** Draft. The RFC number and tracking issue are TBD. This RFC builds
-> on [Multi-Domain Topology for Intra-Device Spyre Tensor
-> Sharding](NNNN-MultiDomainTopologyRFC.md) (Phase 1).
+> **Status:** Draft. The RFC number and tracking issue are TBD. This RFC is the
+> second in the Multi-Domain Topology series and builds on
+> [Multi-Domain Topology for Intra-Device Spyre Tensor
+> Sharding](NNNN-MultiDomainTopologyRFC.md) (Phase 1, PR #44).
+
+This document picks up where the Phase 1 RFC ends. Phase 1 introduced the
+eight-way intra-device sharded Spyre tensor — one ordinary PyTorch tensor whose
+backend storage is split across the eight logical HBM groups of `spyre:0` —
+together with blocking migration, shard-local pointwise execution, and the
+first version of the placement and correction contracts. It deliberately
+excluded any operation whose result depends on more than one shard.
+
+Reductions are that excluded case, and they are the subject of this RFC. A
+reduction over the shard dimension must combine contributions from all eight
+HBM groups, which Phase 1's shard-local model cannot express. Phase 2 adds
+`sum`, `mean`, and value-only `max` over the sharded tensor, extends the
+Phase 1 DeepTools contract from one stage to a two-stage producer/combiner
+interface, and defines the HBM rendezvous, visibility, and failure semantics
+that any later cross-shard operation can reuse.
 
 ## **Summary**
 
@@ -77,12 +93,14 @@ reduction:
   blocked path, and its final ordering and independent external symbolic-range
   tracking must be validated before they become a two-stage runtime ABI; and
 - the checked-in 1p5 UMI DMA and compute paths are incomplete, the public Senlib
-  `Dva` API currently fixes `VA[39]` to zero, and there is no verified global
-  HBM cache coherence or arbitrary-participant on-device barrier.
+  addressing API does not yet expose a requester-aware virtual-address selector,
+  and there is no verified producer-to-consumer write-visibility protocol or
+  arbitrary-participant on-device barrier.
 
 The last group of facts is why the initial algorithm is conservative. It uses a
 centralized HBM rendezvous, a blocking host-orchestrated visibility boundary
-between stages, and no HBM atomics, rather than assuming coherence, a device
+between stages, and no HBM atomics, rather than assuming a verified visibility
+model, a device
 barrier, or a native collective that the current stack does not prove. An
 explicit, versioned cross-layer contract is required so that shard, partial,
 scratch-slot, endpoint, and receipt identities are never inferred from vector
@@ -118,8 +136,10 @@ The Phase 2 milestone does not provide:
   any change in `../pytorch`;
 - direct `Partial -> Shard` reduce-scatter, which is a hard Phase 3 boundary;
 - direct ring, LX, core-to-core, or card/rank RDMA communication transport;
-- HBM atomics, global HBM coherence, selectable `VA[39]`, or an
-  arbitrary-endpoint device barrier without separately verified capabilities;
+- HBM atomics, an assumed producer-to-consumer visibility model without a
+  verified protocol, a selectable virtual-address interleave
+  policy, or an arbitrary-endpoint device barrier without separately verified
+  capabilities;
 - a public `Partial` tensor, a generic collective API, or arbitrary
   user-defined reductions;
 - index-producing `max`, `argmax`, or `(values, indices)` output;
@@ -130,6 +150,33 @@ The Phase 2 milestone does not provide:
 - performance parity with a future direct-communication implementation.
 
 ## **Proposed Implementation**
+
+### Reader's model
+
+For reviewers less familiar with PyTorch tensor sharding, the two pictures this
+RFC is about:
+
+```text
+What PyTorch sees                 What the device holds
+───────────────────               ─────────────────────
+x: one ordinary tensor            eight equal shards, one per logical
+   on spyre:0                     HBM group, split along one dimension
+
+  [------------- x -------------]       [shard 0][shard 1] ... [shard 7]
+         global shape                   group 0   group 1        group 7
+```
+
+```text
+Cross-shard reduction over two stages
+
+Stage A (groups 0..7)          host boundary               Stage B
+────────────────────────       ──────────────               ─────────────
+local reduce on each      -->  all 8 producers         -->  read slots 0..7
+shard -> one finalized        terminal + visibility        in order, apply the
+partial, written once         protocol executed,          combine rule, write
+to its scratch slot           slots published for         the designated
+(group-local HBM)             this epoch only              output once
+```
 
 ### User-visible contract
 
@@ -181,16 +228,19 @@ PyTorch reduction request
              +-----------+-----------+
              |                       |
              v                       v
-       Flex / Senlib              DeepTools
-  hard-bound scratch and         two-stage programs,
-  designated-output              symbolic partial/scratch/output
-  allocation, receipts,          ranges, final per-HCM manifests
-  topology, visibility,                  |
-  translation, submission                |
+          Flex                   DeepTools
+  (UMI is a Flex backend,   two-stage programs,
+   not a separate stack      symbolic partial/scratch/output
+   component)                ranges, final per-HCM manifests
+  hard-bound scratch and             |
+  designated-output                  |
+  allocation, receipts,              |
+  topology, visibility,              |
+  translation, submission            |
              |                       |
              +-----------+-----------+
                          v
-                    UMI runtime
+                   Senlib device runtime
         Stage A/Stage B submission, visibility
         operations, address activation, correction,
         completion aggregation, epoch retirement
@@ -219,6 +269,34 @@ The ownership boundaries are normative:
 `SpyreCode` serialization remains domain-agnostic: it may validate HCM IDs,
 shapes, and counts, but must not interpret shard ordinals, choose an HBM group,
 resolve a receipt, allocate a translation slot, or apply topology policy.
+
+#### Component responsibility matrix
+
+The same boundaries in table form, feature by feature:
+
+| Feature | torch-spyre | Flex | Senlib | DeepTools |
+| --- | --- | --- | --- | --- |
+| Reduction admission and classification | owns | | | |
+| `Complete`/`Partial` semantic state, `SpyrePartial` | owns | | | |
+| Shard-dim remapping and numerical policy | owns | | | |
+| Scratch/output placement intent and receipts | requests | realizes | | |
+| Logical HBM group and endpoint selection | requests | realizes | qualifies | |
+| Concrete device virtual address assignment and translation-slot lifecycle | | owns | provides | |
+| Virtual-address bit policy | | owns | provides | |
+| Two-stage program structure and symbolic ranges | supplies | | | owns |
+| Authoritative final per-HCM manifests | validates | | | owns |
+| Visibility protocol and barriers | selects | | provides/qualifies | |
+| Epoch and receipt validation at launch | owns | | | |
+
+#### Addressing abstraction boundary
+
+Low-level addressing facts — device virtual addresses, translation-slot
+state, and virtual-address bit policies — are owned by Flex and Senlib and must
+not appear as torch-spyre concepts. torch-spyre plans, validates, and launches
+entirely in terms of logical endpoints, receipts, and byte ranges; it calls
+through a Flex-provided addressing interface to resolve a device virtual
+address for a declared requester, and remains unaware of which address bits
+that resolution consumes. This matches the current 1p0 strategy.
 
 ### Phase 1 prerequisite
 
@@ -259,8 +337,11 @@ The implementation must preserve these invariants:
    aliasing and in-place partial overwrite are prohibited.
 7. Generated execution uses explicit profile-provided endpoint IDs, never
    `range(32)` and never `core_id == chunk_index`.
-8. Concrete addresses and transient translation slots do not enter compiler
-   cache keys unless generated code embeds a slot.
+8. Allocation, activation, and addressing are distinct: a physical allocation
+   identity, a translation-slot binding, and a device virtual address are three
+   different objects, and an allocation may exist without occupying a
+   translation window. Concrete addresses and transient translation slots do
+   not enter compiler cache keys unless generated code embeds a slot.
 9. The runtime resolves and validates every live binding, per stage, before
    correction or launch.
 10. Any failed participant fails the complete logical operation; there is no
@@ -305,7 +386,9 @@ elementwise reduction across the eight partials.
 A cross-shard planner creates an address-free internal `SpyrePartial` value that
 records the operation, global and partial shapes, reduced dimensions, `keepdim`,
 the frozen numerical policy identity, a partial-layout signature, and the
-explicit participant/shard/replica/partial ownership mappings. A layout
+explicit participant/shard/replica/partial ownership mappings. `SpyrePartial`
+is defined and owned by torch-spyre; it is not a Flex type and never crosses a
+component ABI. A layout
 signature describes encoding only; it does not identify an HBM group, scratch
 slot, receipt, endpoint, or live address. Equal partial encodings may share one
 layout class while occupying eight distinct, non-overlapping ranges. The full
@@ -344,9 +427,13 @@ The planner selects one scratch-home logical HBM group and one designated-output
 logical HBM group. They may be the same group but are separate allocations, each
 independently validated. Selection considers, in order, a validated
 locality-profile mapping, verified read/write behavior for every selected
-endpoint, a supported requester/XLAT/access-mode and fixed-zero `VA[39]` policy,
-usable capacity after reservations and qualified sparing, and a deterministic
-configured home-group policy. Phase 2 v1 runs no route or global cost optimizer;
+endpoint, a supported requester and access mode under the encapsulated
+Flex/Senlib addressing policy, usable capacity after reservations and qualified
+sparing — in the checked-in 1p5 configuration, logical group 0 carries a fixed
+firmware reservation, and channel sparing reduces every group's usable capacity
+below nominal — and a deterministic configured
+home-group policy. Phase 2 v1 runs no
+route or global cost optimizer;
 an unqualified endpoint or runtime configuration is a correctness failure, not
 an expensive candidate.
 
@@ -368,7 +455,7 @@ Phase 2 consumes the exact immutable, address-free topology snapshot defined by
 Phase 1; it does not define a reduction-only topology vocabulary. For each
 source, scratch, or output allocation, torch-spyre looks up the receipt's actual
 `logical_hbm_group_id` and obtains exactly four qualified compute endpoints. The
-profile is not proof of requester permissions, XLAT behavior, or memory
+profile is not proof of requester permissions, translation behavior, or memory
 visibility; those remain separately versioned hardware capabilities and tests.
 Every producer and combiner endpoint choice is serialized in the plan; the
 runtime does not select or remap endpoints.
@@ -378,15 +465,15 @@ The minimum producer-to-consumer ordering is:
 ```text
 producer compute terminal success
   -> producer HBM write terminal success
-  -> producer cache flush/fence, if required
+  -> producer memory fence, if required
   -> all-producer host stage boundary
-  -> consumer cache invalidate/discard, if required
+  -> consumer read ordering, if required
   -> consumer HBM reads
 ```
 
-The design must not equate XLAT activation with data visibility, command
+The design must not equate translation activation with data visibility, command
 submission with completion, route existence with permission, a control barrier
-with an HBM memory fence, or successful 1p0 emulation with native coherence. The
+with an HBM memory fence, or successful 1p0 emulation with native visibility. The
 visibility protocol is an owner-approved, versioned capability ID; there is no
 implicit `none` policy. If no tested protocol exists, cross-shard execution is
 disabled while shard-local reductions remain eligible.
@@ -396,7 +483,8 @@ Stage A producers plus the required visibility protocol is the barrier. This
 avoids relying on an arbitrary-participant device barrier, whose current
 inspected implementation assumes a consecutive worker set. An on-device barrier
 may replace the host boundary only after its participants, semantics, namespace,
-generation, count, timeout, cache behavior, and cancellation interaction are
+generation, count, timeout, memory-ordering behavior, and cancellation
+interaction are
 specified and tested. Every reduction gets a unique epoch that every slot,
 publication state, barrier generation, HCM binding, and completion object
 references; an epoch mismatch is `SCRATCH_EPOCH_STALE` and is never repaired by
@@ -457,9 +545,9 @@ its ABI, HCM stage, binding role (`input`, `partial_write`, `partial_read`,
 `workspace`, `output`), the applicable shard/replica/partial identity, the
 expected logical HBM group and receipt-identity class, the compute endpoint and
 local ordinal, the byte offset and valid length, the access mode, the local
-layout signature, the profile fingerprint, the translation and `VA[39]`
-policies, and the epoch class. Inapplicable identity fields are absent, not
-filled with ambiguous sentinels.
+layout signature, the profile fingerprint, the encapsulated translation and
+addressing policies, and the epoch class. Inapplicable identity fields are
+absent, not filled with ambiguous sentinels.
 
 DeepTools may derive, expand, and reorder symbols while compiling. It must
 therefore emit the **authoritative** final per-HCM manifest only after those
@@ -481,18 +569,18 @@ At runtime, for each HCM parameter, torch-spyre selects the declared binding
 role, resolves the relevant live input, scratch, workspace, or output receipt,
 validates allocation and receipt liveness, semantic slot/shard/replica/partial
 and endpoint mappings, physical logical-HBM placement, layout signature, access
-mode, alignment, valid range, topology, and epoch, reserves a compatible
-translation mapping, adds the declared byte offset with checked arithmetic,
-produces the DVA for the declared requester and fixed-zero policy, and stores it
-at the exact `parameter_index`. It then requires, per HCM:
+mode, alignment, valid range, topology, and epoch, adds the declared byte offset
+with checked arithmetic, obtains the device virtual address for the declared
+requester through the Flex-provided addressing interface, and stores it at the
+exact `parameter_index`. It then requires, per HCM:
 
 ```text
 symbolic_inputs.size() == hcm_manifest.parameter_count
 symbolic_inputs.size() == ComputeOnHostCommand.ishape[0]
 ```
 
-No live DVA enters the compiled artifact, and reallocation at different
-addresses reuses compatible code.
+No live device virtual address enters the compiled artifact, and reallocation
+at different addresses reuses compatible code.
 
 #### Required DeepTools support
 
@@ -552,6 +640,15 @@ zero. Semantic identities must remain distinct; rewriting every slot to zero
 would not exercise planning, ownership, binding, ordering, or failure handling.
 Each shard, scratch, and output allocation stays a separately owned single-chunk
 domain-0 buffer, and no multi-chunk address reaches the PF or VF scheduler.
+Distinct semantic identity does not require distinct firmware allocations: the
+eight buffers may be sub-blocks of one Flex region and share one firmware
+allocation index, while retaining distinct shard identity, non-overlapping live
+ranges, and independent lifetimes.
+
+The emulator lives entirely in the experimental 1p5 emulation backend; no
+production 1p0 VF or PF code path is modified, so production behavior is
+unchanged by construction and the 1p0 stack is not used as a proving ground
+for experimental 1p5 semantics.
 
 The emulator proves reduction classification and remapping, semantic placement
 mappings, `SpyrePartial` construction, non-overlapping slot planning, the sum,
@@ -559,15 +656,23 @@ mean-count, and value-only max policies, deterministic ordering, final
 manifest/binding invariants, epochs and stale-slot rejection, designated
 single-copy semantics, and aggregate failure and output-validity behavior. It
 cannot prove physical eight-group placement, cross-group routing or permissions,
-native DVA/XLAT behavior, producer-to-combiner visibility, a native fence or
-barrier, coherence, or 1p5 UMI readiness. Every 1p0 trace is tagged
-`is_emulated = true` and `native_cross_group_behavior_exercised = false`, and
+native addressing and translation behavior, producer-to-combiner visibility, a
+native fence or
+barrier, or 1p5 UMI readiness. Every emulator trace records which
+backend device the trace ran on (`vf`, `pf`, `1p5_emul`, or `umi`) rather than
+collapsing that identity into a single boolean, so the distinction survives
+beyond the trial phase; a `1p5_emul` trace additionally records
+`native_cross_group_behavior_exercised = false`, and
 passing the emulator never closes a native accessibility or visibility gate.
 
 ### Rollout and future phases
 
 All Phase 2 paths are fail-closed and disabled by default until their dependency
-packages and capability gates pass. A disabled or rejected cross-shard path does
+packages and capability gates pass. "Disabled by default" is precise: each level
+below is off unless its gate record passes, and the emulator-only levels (1 and
+2) cannot be enabled on the VF or PF backends at all, because their code lives
+in the 1p5 emulation backend rather than in production 1p0 paths. A disabled or
+rejected cross-shard path does
 not silently fall back to unified storage, host reduction, a distributed
 collective, or incomplete local outputs. Rollout uses independently controllable
 levels, each with a separately auditable backend gate that records its decision,
@@ -630,20 +735,21 @@ optimization but do not replace the correctness gates.
 
 Routing every partial through one homed HBM buffer and a host-orchestrated
 barrier is deliberately conservative. It trades bandwidth and latency for a
-correctness oracle that does not depend on unproven coherence, atomics, or
+correctness oracle that does not depend on unproven visibility, atomics, or
 device barriers. Faster direct communication is explicitly deferred to Phase 3.
 
 ### Many dependent hardware gates
 
 Native cross-shard execution depends on unverified capabilities — cross-group
-read/write permission, a producer-to-consumer visibility protocol, fixed-zero
-`VA[39]` for every requester, and complete 1p5 UMI DMA and compute. Each is a
-gate, and the native path stays disabled until owner evidence closes it.
+read/write permission, a producer-to-consumer visibility protocol, a verified
+per-requester addressing policy, and complete 1p5 UMI DMA and compute. Each is
+a gate, and the native path stays disabled until owner evidence closes it.
 
 ### Cross-stack complexity
 
 Two-stage ABIs, receipt-bound scratch, epochs, and authoritative final manifests
-add versioned boundaries across torch-spyre, Flex, Senlib, UMI, and DeepTools.
+add versioned boundaries across torch-spyre, Flex (including its UMI
+backend), Senlib, and DeepTools.
 Implicit conventions would be unsafe when allocation order, topology, or symbol
 ordering changes, but the explicit contracts increase implementation work.
 
@@ -777,10 +883,18 @@ compile-time and runtime interface can be frozen:
 
 ### Other design decisions
 
-1. Which runtime component owns live XLAT slot reservation, eviction, and
-   conflict isolation across both stages and concurrent operations?
-2. Does each endpoint require its own corrected DVA, or can a group share one
-   interpretation under the supported requester and fixed-zero policy?
+1. Which runtime component owns live translation-slot reservation,
+   eviction, and conflict isolation across both stages and concurrent
+   operations? The resource is bounded: each logical HBM group exposes only
+   four translation windows, shared by every concurrent operation touching
+   that group, so concurrent cross-shard reductions compete for regions
+   within a group. Whatever the answer, this state must stay inside
+   Flex/Senlib and remain abstracted from torch-spyre, as in the current 1p0
+   strategy.
+2. Does each endpoint require its own corrected device virtual address, or can
+   a group share one interpretation under the supported requester and
+   addressing policy? The answer is a Flex/Senlib ABI detail; torch-spyre
+   must not depend on it.
 3. Is an extra output visibility operation required before D2H or downstream
    compute consumes the designated output?
 4. What is the terminal failure contract after only a subset of producers has
@@ -797,10 +911,17 @@ disabled on a target until evidence answers them:
 1. Which exact producer and combiner
    `(logical_hbm_group_id, access_port_id, compute_endpoint_id)` records have
    production read and write permission?
-2. What exact producer fence, cache flush, consumer invalidation, and completion
-   sequence establishes producer-to-combiner visibility, and which completion
+2. What exact producer fence, write-completion, and consumer read-ordering
+   sequence establishes producer-to-combiner visibility (the design assumes no
+   programmer-visible data cache, so the question is ordering through the
+   memory path, not cache maintenance), and which completion
    result proves all producer HBM writes are terminal?
-3. Is fixed `VA[39] = 0` valid for every Phase 2 compute and DMA requester?
+3. Is fixed `VA[39] = 0` valid for every Phase 2 requester? Verified senlib
+   behavior splits the question: DMA requesters ignore the bit, RCU requesters
+   use it to select an HMI/TNID service group, and R5SS requesters use it to
+   distinguish firmware from user translations. The gate therefore reduces to
+   proving the fixed-zero choice correct for the RCU and R5SS requesters
+   Phase 2 actually issues.
 4. Will Phase 2 use only host-orchestrated sequencing, or is a mask/list
    arbitrary-endpoint barrier available and generation-safe?
 5. Can Flex and Senlib physically hard-bind both scratch and designated output to
@@ -839,8 +960,8 @@ implementation remains runnable as the Phase 3 correctness oracle.
 2. Agree with DeepTools owners on the two-stage reduction ABIs, symbolic
    scratch/partial/output preservation, the authoritative final per-HCM manifest
    for both stages, and the `SpyreCode` runtime handoff.
-3. Resolve the remaining native access, visibility, barrier, and `VA[39]` gates
-   with Flex and Senlib owners.
+3. Resolve the remaining native access, visibility, barrier, and addressing
+   gates with Flex and Senlib owners.
 4. Freeze the versioned reduction semantics, numerical policies, `SpyrePartial`,
    scratch/output, receipt, epoch, and final-binding contracts.
 5. Validate the 1p0 semantic oracle and native shard-local reductions, which do
@@ -860,8 +981,9 @@ TBD.
 #### Exceptions
 
 Direct `Partial -> Shard` reduce-scatter, direct ring/LX/core-to-core or
-card/rank RDMA communication, HBM atomics, global coherence, selectable
-`VA[39]`, arbitrary-endpoint barriers, asynchronous overlap and pipelined scratch
+card/rank RDMA communication, HBM atomics, global coherence, a selectable
+virtual-address interleave policy, arbitrary-endpoint barriers, asynchronous
+overlap and pipelined scratch
 reuse, cancellation, index-producing `max`, uneven or dynamic shards, and any
 change to `../pytorch` or distributed runtime remain outside the Phase 2
 milestone. They require separate design and qualification.
